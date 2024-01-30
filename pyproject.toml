@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "cyclic_scheduling_dse"
+version = "0.1.0"
+description = ""
+authors = ["Andrea Nardi <buongiorno19972@gmail.com>"]
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+networkx = "^3.2.1"
+
+[tool.poetry.dev-dependencies]
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
