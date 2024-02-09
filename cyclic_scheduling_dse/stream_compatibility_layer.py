@@ -4,7 +4,9 @@ from itertools import repeat
 from sdf_expander import Sdf
 from enum import Enum
 from math import ceil
+import numpy as np
 import sys
+import networkx as nx
 from networkx.algorithms.minors import contracted_edge
 from networkx.algorithms.components import node_connected_component
 from networkx import DiGraph, Graph, induced_subgraph
@@ -14,14 +16,15 @@ from dataclasses import dataclass, replace
 from enum import IntEnum
 from stream.classes.opt.allocation.genetic_algorithm.fitness_evaluator import FitnessEvaluator
 from stream.classes.cost_model.communication_manager import CommunicationLinkEvent
-from typing import Optional, Any, Dict, cast, Hashable
+from typing import Optional, Any, Dict, cast, Hashable, Union, Literal
 from stream.classes.workload.computation_node import ComputationNode
 from stream.classes.workload.simd_node import SimdNode
 from stream.classes.workload.elementwise_node import ElementwiseNode
 from stream.classes.workload.flatten_node import FlattenNode
 from stream.classes.workload.dummy_node import DummyNode
 from stream.classes.hardware.architecture.accelerator import Accelerator
-from .mapping import WorkloadNode, WorkloadEdge, display_workload_graph, workload_graph_to_mapped_graph, display_mapped_graph, mapped_to_hsdf, minimum_memory_schedule, display_mapped_hsdf, MappedEdge, MappedNode
+from logging import warning, info
+from .mapping import WorkloadNode, WorkloadEdge, display_workload_graph, workload_graph_to_mapped_graph, display_mapped_graph, mapped_to_hsdf, earliest_first, display_mapped_hsdf, MappedEdge, MappedNode, add_minimum_buffers, Convolution1D, latest_first, OptimizationType, optimize
 
 from cyclic_scheduling import CyclicSchedulingProblem
 
@@ -73,16 +76,40 @@ def has_cyclic_dependence(token_graph):
 class AcceleratorVirtualMachine:
     accelerator: Accelerator
     latency: int
+    considered_dimension: str
 
-    def __init__(self, accelerator: Accelerator, workload):
+    def __init__(self, accelerator: Accelerator, workload, considered_dimension):
         self.latency = 0
         from stream.classes.cost_model.scheduler import initialize_offchip_tensors
         self.accelerator = accelerator
         self.workload = workload
+        self.considered_dimensions = [considered_dimension, {'OX':'IX', 'OY':'IY'}[considered_dimension]]
         initialize_offchip_tensors(workload, accelerator)
 
+    def load_weights(self, layer_core_mapping: Dict[str, int]) -> int:
+        offchip_core_id = self.accelerator.offchip_core_id
+        offchip_core = self.accelerator.get_core(offchip_core_id)
+
+        time_offset = 0
+        already_loaded = set()
+        for n in self.workload.nodes():
+            for op, tensor in n.operand_tensors.items():
+                if op in n.constant_operands and all(d not in tensor.loop_dimensions for d in self.considered_dimensions):
+                    #Move tensor
+                    core_id = layer_core_mapping[n.name]
+                    if (core_id, tensor) in already_loaded:
+                        continue
+                    already_loaded.add((core_id, tensor))
+                    core = self.accelerator.get_core(layer_core_mapping[n.name])
+                    [communication_link, *_] = self.accelerator.communication_manager.get_links_for_pair(offchip_core, core)
+                    transfer_time = ceil(tensor.size/communication_link.bandwidth)
+                    self.copy_tensor(offchip_core, core, tensor, time_offset, transfer_time, 0) #TODO fix
+                    time_offset += transfer_time
+        return time_offset
+
+
     def copy_tensor(self, core1, core2, tensor, start, duration, energy):
-        #print(f"Copyimg {tensor} at {start} from {core1} to {core2}")
+        info(f"Copying {tensor} at {start} from {core1} to {core2}")
         [communication_link, *_] = self.accelerator.communication_manager.get_links_for_pair(core1, core2)
         communication_link.transfer(
             CommunicationLinkEvent(
@@ -104,16 +131,16 @@ class AcceleratorVirtualMachine:
         memory_op = tensor.memory_operand
         top_instance = self.accelerator.get_top_instance_of_core(core1, memory_op)
         if not self.accelerator.memory_manager.contains(tensor, top_instance):
-            print(f"WARNING: no {tensor} in {core1} {top_instance}")
+            warning(f"no {tensor} in {core1} {top_instance}")
 
         self.latency = max(self.latency, start + duration)
         
     def free(self, core, tensor, start):
-        #print(f"Freeimg {tensor} at {start} in {core}")
+        info(f"Freeing {tensor} at {start} in {core}")
         memory_op = tensor.memory_operand
         top_instance = self.accelerator.get_top_instance_of_core(core, memory_op)
         if not self.accelerator.memory_manager.contains(tensor, top_instance):
-            print(f"WARNING: no {tensor} in {core} {top_instance}")
+            info(f"WARNING: no {tensor} in {core} {top_instance}")
         self.accelerator.memory_manager.remove_tensor_from_top_instance(
             top_instance,
             tensor,
@@ -121,7 +148,7 @@ class AcceleratorVirtualMachine:
         )
 
     def compute(self, core, cn, start, duration):
-        #print(f"Executing {cn.name} at {start} producing {cn.operand_tensors['O']} in {core}")
+        info(f"Executing {cn.name} at {start} producing {cn.operand_tensors['O']} in {core}")
         out_tensor = cn.operand_tensors['O']
 
         self.accelerator.memory_manager.add_tensor_to_core(
@@ -139,23 +166,22 @@ class AcceleratorVirtualMachine:
 class CyclicFitnessEvaluator(FitnessEvaluator):
     metadata: Dict[str, ActorMetadata]
     accelerator: Accelerator
+    sdf_relation: Union[Literal['OX'], Literal['OY']]
+    optimization_type: OptimizationType
 
-    def __init__(self, workload, original_workload, node_hw_performances, layer_groups_flexible, accelerator, start_layer, layer_cuts, sdf_relation):
-        self.weights = [-1, -1]
-        self.metrics = ["energy", "latency"]
+
+    def __init__(self, workload, original_workload, node_hw_performances, layer_groups_flexible, accelerator, sdf_relation, optimization_type: OptimizationType):
+        self.weights = [-1]
+        self.metrics = ["energy"]
         self.original_workload = original_workload
         self.workload = workload
         self.layer_groups_flexible = layer_groups_flexible
         self.accelerator = accelerator
         # custom
-        self.start_layer = start_layer
-        self.layer_cuts = layer_cuts
         self.sdf_relation = sdf_relation
-        
+        self.optimization_type = optimization_type
         
         original_workload = self.original_workload
-        start_layer = self.start_layer
-        layer_cuts = self.layer_cuts
         
         self.mappings = {
             layer.name: {
@@ -171,22 +197,9 @@ class CyclicFitnessEvaluator(FitnessEvaluator):
         oy = sp.Symbol("oy")
         fy = sp.Symbol("fy")
         
-        self.finer_nodes = {n.name: n for n in self.workload.nodes() if n.id[1] == 0}
+        self.finer_nodes: dict[str, ComputationNode] = {n.name: n for n in self.workload.nodes() if n.id[1] == 0}
 
         workload = pickle_deepcopy(original_workload)
-        
-        start_nodes = list(n for n in workload.nodes() if isinstance(n, ComputationNode) and n.name == start_layer)
-        
-        assert len(start_nodes) > 0
-        
-        [start_node, *_] = start_nodes
-        
-        for src, trg in list(workload.edges()):
-            if hasattr(src, 'name') and hasattr(trg, 'name') and (src.name, trg.name) in layer_cuts:
-                workload.remove_edge(src, trg)
-                
-        workload_nodes = node_connected_component(Graph(workload), start_node)
-        workload = induced_subgraph(workload, workload_nodes).copy()
         
         for src, trg in list(workload.edges()):
             if isinstance(trg, DummyNode):
@@ -251,13 +264,17 @@ class CyclicFitnessEvaluator(FitnessEvaluator):
             
             finer_trg = self.finer_nodes[node.name]
             production_rate = finer_trg.loop_dim_size[self.sdf_relation]
-            
+            assert (finer_trg.operand_tensors['O'].size % production_rate) == 0
             cn = WorkloadNode(
                 id=node.name,
-                kernel_size=kernel,
-                padding=padding,
-                stride=stride,
-                production_rate=production_rate,
+                conv1d=Convolution1D(
+                    kernel_size=kernel,
+                    padding=padding,
+                    stride=stride,
+                    production_rate=production_rate,
+                    output_token_size=finer_trg.operand_tensors['O'].size // production_rate,
+                    input_token_size=finer_trg.operand_tensors['I'].size,
+                ),
                 n_execution=n_execution,
             )
             nodes[node.name] = cn
@@ -281,7 +298,6 @@ class CyclicFitnessEvaluator(FitnessEvaluator):
         self.mrsdf = mrsdf
     
     def get_fitness(self, core_allocations, return_scme=False):
-        core_allocations = [0, 0, 1, 0, 0]
         from dataclasses import replace
         layer_core_mapping: Dict[str, int] = self.fixed_core_allocations | { self.finer_nodes[layer_name].name: core_id for layer_name, core_id in zip(self.layer_groups_flexible, core_allocations) }
         
@@ -328,37 +344,32 @@ class CyclicFitnessEvaluator(FitnessEvaluator):
         (hsdf, _) = mapped_to_hsdf(mapped)
 
         #display_mapped_hsdf(hsdf)
+        add_minimum_buffers(hsdf)
+        cycle_time, t = optimize(hsdf, self.optimization_type)  
+            
 
-        minimum_memory_schedule(hsdf, self.mrsdf)
+        #earliest_first(hsdf, self.mrsdf)
+        latest_first(hsdf, self.mrsdf)
 
-        cyclic_scheduling = CyclicSchedulingProblem()
+        def get_load_energy(i):
+            c = get_load_channel_link(i)
+            return ceil(self.finer_nodes[i].operand_tensors['I'].size/c.bandwidth)*c.unit_energy_cost
+        
+        def get_store_energy(i):
+            c = get_store_channel_link(i)
+            return ceil(self.finer_nodes[i].operand_tensors['O'].size/c.bandwidth)*c.unit_energy_cost
+        
+        def get_transfer_energy(i1, i2):
+            c = get_channel_link(i1, i2)
+            return ceil(self.finer_nodes[i1].operand_tensors['O'].size/c.bandwidth)*c.unit_energy_cost
 
-        for core in filter(lambda x: x is not None, set(cast(MappedNode, a).processor for a in mapped.nodes)):
-            cyclic_scheduling.add_processor(core)
-        cyclic_scheduling.add_processor("other")
-
-        node_to_index = {n: i for i, n in enumerate(hsdf.nodes)}
-
-        layers = sorted(((actor.name, actor.id[0]) for actor in self.finer_nodes.values()), key=lambda x: x[1])
-        from matplotlib.colors import to_hex
-        from matplotlib import colormaps
-        import numpy as np
-        rainbow = colormaps["rainbow"]
-        colors = dict(zip(map(lambda x: x[0], layers), map(to_hex, rainbow(np.linspace(0, 1, len(layers))))))
-        nodes = list(hsdf.nodes)
-        for a in nodes:
-            cyclic_scheduling.add_actor(f"{node_to_index[a]})", a[0].execution_time, "other" if a[0].processor is None else a[0].processor, color=colors[a[0].id])
-
-        for a, b, c in hsdf.edges.data('weight'):
-            cyclic_scheduling.add_channel(f"{node_to_index[a]})", f"{node_to_index[b]})", c.initial_tokens)
-
-        solution = cyclic_scheduling.solution(relaxed=True)
-
+        energy = sum(self.mappings[n.id][layer_core_mapping[n.id]].energy * n.n_execution for n in self.mrsdf.nodes) + \
+                sum(get_load_energy(n.id) * n.n_execution for n in self.mrsdf.nodes if self.mrsdf.in_degree(n) == 0) + \
+                sum(get_store_energy(n.id) * n.n_execution for n in self.mrsdf.nodes if self.mrsdf.out_degree(n) == 0) + \
+                sum(get_transfer_energy(n1.id, n2.id) * n1.n_execution for n1, n2 in self.mrsdf.edges if self.get_core(n1.id, layer_core_mapping) != self.get_core(n2.id, layer_core_mapping))
         if not return_scme:
-            return 0, solution.cycle_time
+            return energy,
         else:
-
-            cycle_time = solution.cycle_time
 
             def count_repetition(repetition: dict[Hashable, int], a):
                 (actor, _) = a
@@ -366,16 +377,15 @@ class CyclicFitnessEvaluator(FitnessEvaluator):
                 repetition[actor] += 1
                 return repetition
 
-            actor_repetitions = reduce(count_repetition, nodes, dict())
-            actor_priority_queue = list(zip(solution.t, repeat(0), hsdf.nodes()))
-            heapify(actor_priority_queue)
+            actor_repetitions = reduce(count_repetition, hsdf.nodes, dict())
 
             workload = pickle_deepcopy(self.workload)
             accelerator = pickle_deepcopy(self.accelerator)
-            vm = AcceleratorVirtualMachine(accelerator, workload)
+            vm = AcceleratorVirtualMachine(accelerator, workload, self.sdf_relation)
+            time_offset = vm.load_weights(layer_core_mapping)
 
-            energy = 0 #TODO fix
-            latency = 0
+            actor_priority_queue = list(zip(t + time_offset, repeat(0), hsdf.nodes()))
+            heapify(actor_priority_queue)
 
             # Handle events in cronological order
 
@@ -436,23 +446,32 @@ class CyclicFitnessEvaluator(FitnessEvaluator):
                 operands_to_prefetch=[],
             )
             scme.latency = vm.latency
-            #print(f"LATENCY {vm.latency}")
-            store = cast(MappedNode, next(filter(lambda n: n.t.t == "Store", mapped.nodes)))
-            #print(f"ESTIMATED LATENCY {}")
+
+            self.workload
             scme.energy = energy
-            scme.cyclic_scheduling = cyclic_scheduling
-            return 1, solution.cycle_time, scme
+            return energy, cycle_time, scme
 
     def get_core(self, actor_name: str, layer_core_mapping: Dict[str, int]):
         return self.accelerator.get_core(layer_core_mapping[actor_name])
-   
-        
+
+@dataclass
+class MinimumMemory:
+    t = "MinimumMemory"
+
+@dataclass
+class MinimumLatency:
+    t = "MinimumLatency"
+
+@dataclass
+class MinimumLatency:
+    t ="MinimumLatency"
         
 class CyclicFitnessEvaluatorBuilder:
-    def __init__(self, start_layer, layer_cuts, sdf_relation):
-        self.start_layer = start_layer
-        self.layer_cuts = layer_cuts
+    sdf_relation: Union[Literal['OX'], Literal['OY']]
+
+    def __init__(self, sdf_relation, optimization_type: OptimizationType = MinimumMemory()):
         self.sdf_relation = sdf_relation
+        self.optimization_type = optimization_type
         
     def __call__(
         self,
@@ -466,9 +485,8 @@ class CyclicFitnessEvaluatorBuilder:
     ):
         m = { n.id[0]: n.name for n in workload.nodes }
         return CyclicFitnessEvaluator(
-            start_layer=self.start_layer,
-            layer_cuts=self.layer_cuts,
             sdf_relation=self.sdf_relation,
+            optimization_type=self.optimization_type,
             workload=workload,
             original_workload=original_workload,
             node_hw_performances=node_hw_performances,

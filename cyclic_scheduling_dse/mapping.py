@@ -6,6 +6,7 @@ import networkx as nx
 from math import ceil
 from sdf_expander import Sdf
 from itertools import chain
+import numpy as np
 
 
 ID = TypeVar('ID', bound=Hashable)
@@ -14,30 +15,37 @@ CORE = TypeVar('CORE', bound=Hashable)
 CHANNEL = TypeVar('CHANNEL', bound=Hashable)
 # Initial sdf
 
+@dataclass
+class Convolution1D:
+    kernel_size: int
+    padding: int
+    stride: int
+    production_rate: int
+    output_token_size: int
+    input_token_size: int
 
 @dataclass
 class WorkloadNode(Generic[ID]):
 
     id: ID
-    kernel_size: int
-    padding: int
-    stride: int
-    production_rate: int
+    conv1d: Convolution1D
     n_execution: int
 
     def __hash__(self) -> int:
         return hash(self.id)
 
+    def production_rate(self):
+        return self.conv1d.production_rate
     def consumption_rate(self):
-        return self.production_rate * self.stride
+        return self.production_rate() * self.conv1d.stride
 
     def in_initial_tokens(self):
         # After how many input rows can it fire
-        return self.consumption_rate() - self.kernel_size + self.padding
+        return self.consumption_rate() - self.conv1d.kernel_size + self.conv1d.padding
 
     def freeing_initial_tokens(self):
         # After how many firing can it release memory
-        return -self.padding  # TODO
+        return -self.conv1d.padding  # TODO
 
 
 @dataclass
@@ -101,22 +109,30 @@ def display_mapped_hsdf(graph: DiGraph):
 
 
 @dataclass
-class TransferNodeType:
+class TransferNodeType(Generic[CORE]):
     t: Literal['Transfer']
     core1: CORE
     core2: CORE
-    def __init__(self, core1: CORE, core2: CORE):
+    conv1d: Convolution1D
+    n_execution: int
+    def __init__(self, core1: CORE, core2: CORE, conv1d: Convolution1D, n_execution: int):
         self.t = 'Transfer'
         self.core1 = core1
         self.core2 = core2
+        self.conv1d = conv1d
+        self.n_execution = n_execution
 
 
 @dataclass
 class ComputationNodeType:
     t: Literal['Computation']
+    conv1d: Convolution1D
+    n_execution: int
 
-    def __init__(self):
+    def __init__(self, conv1d: Convolution1D, n_execution: int):
         self.t = 'Computation'
+        self.conv1d = conv1d
+        self.n_execution = n_execution
 
 
 @dataclass
@@ -132,12 +148,14 @@ class MemoryFreeNodeType:
 
 
 @dataclass
-class LoadType:
+class LoadType(Generic[CORE]):
     t: Literal['Load']
     core2: CORE
-    def __init__(self, core2: CORE):
+    output_token_size: int
+    def __init__(self, core2: CORE, output_token_size):
         self.t = 'Load'
         self.core2 = core2
+        self.output_token_size = output_token_size
 
 
 @dataclass
@@ -209,9 +227,11 @@ class SameProcessorEdgeType:
 @dataclass
 class TensorBufferEdgeType:
     t: Literal['TensorBuffer']
+    buffer_token_size: int
 
-    def __init__(self):
+    def __init__(self, buffer_token_size: int):
         self.t = 'TensorBuffer'
+        self.buffer_token_size = buffer_token_size
 
 
 @dataclass
@@ -245,11 +265,42 @@ class MappedEdge:
 UNMAPPED_ACTOR_ID = TypeVar('UNMAPPED_ACTOR_ID', bound=Hashable)
 MAPPED_ACTOR_ID = TypeVar('MAPPED_ACTOR_ID', bound=Hashable)
 
+@dataclass
+class MinimumMemory:
+    t: Literal['MinimumMemory']
+
+    def __init__(self):
+        self.t = 'MinimumMemory'
+
+@dataclass
+class MinimumLatency:
+    t: Literal['MinimumLatency']
+
+    def __init__(self):
+        self.t = 'MinimumLatency'
+
+@dataclass
+class BoundLatencyMinimumMemory:
+    t: Literal['BoundLatencyMinimumMemory']
+
+    def __init__(self):
+        self.t = 'BoundLatencyMinimumMemory'
+
+@dataclass
+class BoundMemoryMinimumLatency:
+    t: Literal['BoundMemoryMinimumLatency']
+
+    def __init__(self):
+        self.t = 'BoundMemoryMinimumLatency'
+
+OptimizationType = Union[MinimumMemory, MinimumLatency, BoundLatencyMinimumMemory, BoundMemoryMinimumLatency]
+
+
 
 def workload_graph_to_mapped_graph(
         workload: DiGraph,
         core_mapping: Callable[[UNMAPPED_ACTOR_ID], CORE],
-        get_channel: Callable[[CORE, CORE], CHANNEL],
+        get_channel: Callable[[UNMAPPED_ACTOR_ID, UNMAPPED_ACTOR_ID], CHANNEL],
         get_load_channel: Callable[[CORE], CHANNEL],
         get_load_time: Callable[[CORE], int],
         get_store_channel: Callable[[CORE], CHANNEL],
@@ -260,11 +311,11 @@ def workload_graph_to_mapped_graph(
     mapped = DiGraph()
     corresponding_mapped: dict[WorkloadNode[UNMAPPED_ACTOR_ID], MappedNode] = {
         n: MappedNode(
-            t=ComputationNodeType(),
+            t=ComputationNodeType(n.conv1d, n.n_execution),
             id=n.id,
             execution_time=get_execution_time(n.id),
             processor=core_mapping(n.id)
-        ) for n in workload.nodes()
+        ) for n in map(lambda n: cast(WorkloadNode, n), workload.nodes())
     }
 
     corresponding_workload = {b: a for a, b in corresponding_mapped.items()}
@@ -272,6 +323,7 @@ def workload_graph_to_mapped_graph(
     for n in corresponding_mapped.values():
         mapped.add_node(n)
 
+    #Convert nodes and add actors representing transfers
     for wn1, n in corresponding_mapped.items():
         core1 = core_mapping(wn1.id)
 
@@ -291,7 +343,7 @@ def workload_graph_to_mapped_graph(
                         weight=MappedEdge(
                             t=DataEdgeType(),
                             initial_tokens=wn2.in_initial_tokens(),
-                            production_rate=wn1.production_rate,
+                            production_rate=wn1.production_rate(),
                             consumption_rate=wn2.consumption_rate(),
                         )
                     )
@@ -299,7 +351,7 @@ def workload_graph_to_mapped_graph(
                 for wn2 in childs_wn:
                     transfer = MappedNode(
                         id=wn1.id,
-                        t=TransferNodeType(core1, core2),
+                        t=TransferNodeType(core1, core2, wn1.conv1d, wn1.n_execution),
                         execution_time=get_transfer_time(wn1.id, wn2.id),
                         processor=get_channel(wn1.id, wn2.id)
                     )
@@ -310,8 +362,8 @@ def workload_graph_to_mapped_graph(
                         weight=MappedEdge(
                             t=IntoTransferEdgeType(),
                             initial_tokens=0,
-                            production_rate=wn1.production_rate,
-                            consumption_rate=wn1.production_rate,
+                            production_rate=wn1.production_rate(),
+                            consumption_rate=wn1.production_rate(),
                         )
                     )
                     mapped.add_edge(
@@ -320,11 +372,12 @@ def workload_graph_to_mapped_graph(
                         weight=MappedEdge(
                             t=OutFromTransferEdgeType(),
                             initial_tokens=wn2.in_initial_tokens(),
-                            production_rate=wn1.production_rate,
+                            production_rate=wn1.production_rate(),
                             consumption_rate=wn2.consumption_rate(),
                         )
                     )
 
+    #Add Store Node
     for n1 in list(mapped.nodes):
         n1 = cast(MappedNode, n1)
         if mapped.out_degree(n1) == 0:
@@ -336,7 +389,7 @@ def workload_graph_to_mapped_graph(
             )
             assert n1.t.t == 'Computation'
             mapped.add_node(store_node)
-            production_rate = corresponding_workload[n1].production_rate
+            production_rate = corresponding_workload[n1].production_rate()
             mapped.add_edge(n1, store_node, weight=MappedEdge(
                 t=IntoTransferEdgeType(),
                 initial_tokens=0,
@@ -344,69 +397,26 @@ def workload_graph_to_mapped_graph(
                 consumption_rate=production_rate
             ))
 
+    #Add Load Node
     for n1 in list(mapped.nodes):
         if mapped.in_degree(n1) == 0:
+            consumption_rate = corresponding_workload[n1].consumption_rate()
+            assert (n1.t.conv1d.input_token_size % consumption_rate) == 0
             load_node = MappedNode(
-                t=LoadType(n1.processor),
+                t=LoadType(n1.processor, n1.t.conv1d.input_token_size//consumption_rate), # because of how Stream works
                 id=n1.id,
                 execution_time=get_load_time(n1.id),
                 processor=get_load_channel(n1.id)
             )
             mapped.add_node(load_node)
-            consumption_rate = corresponding_workload[n1].consumption_rate()
             mapped.add_edge(load_node, n1, weight=MappedEdge(
                 t=OutFromTransferEdgeType(),
                 initial_tokens=0,
-                production_rate=consumption_rate,
-                consumption_rate=consumption_rate
+                production_rate=consumption_rate, # because of how Stream works
+                consumption_rate=consumption_rate # because of how Stream works
             ))
 
-    nodes_and_children = {cast(MappedNode, n): [(cast(MappedNode, m), cast(
-        MappedEdge, d)) for (_, m, d) in mapped.out_edges(n, 'weight')] for n in mapped.nodes}
-
-    for n1, children in nodes_and_children.items():
-        if len(children) == 0:
-            continue
-        free_node = MappedNode(
-            t=MemoryFreeNodeType( n1.t.core2 if n1.t.t == "Transfer" or n1.t.t == "Load" else n1.processor, "I" if n1.t.t == "Load" else "O"),
-            id=n1.id,
-            execution_time=0,
-            processor=None
-        )
-
-        mapped.add_node(free_node)
-        for n2, d in children:
-            if n2.t.t == 'Computation':
-                wn = corresponding_workload[n2]
-                initial_tokens = wn.freeing_initial_tokens()
-            elif n2.t.t == 'Transfer' or n2.t.t == 'Store':
-                #TODO understand the buffer requiriments
-                initial_tokens = min(chain([1], (corresponding_workload[n3].freeing_initial_tokens() for (n3, _) in nodes_and_children[n2])))  # Can Free as soon as transfered
-            else:
-                raise ValueError("unreachable")
-
-            d = cast(MappedEdge, mapped.edges[n1, n2]['weight'])
-
-            mapped.add_edge(n2, free_node, weight=MappedEdge(
-                t=TensorUsedEdgeType(),
-                production_rate=d.consumption_rate,
-                consumption_rate=d.production_rate,
-                initial_tokens=initial_tokens
-            ))
-
-            buffer_size = ceil(d.consumption_rate/d.production_rate -
-                               d.initial_tokens/d.production_rate - initial_tokens/d.production_rate)
-            if mapped.has_edge(free_node, n1):
-                buffer = mapped.edges[free_node, n1]['weight']
-                buffer.initial_tokens = max(buffer.initial_tokens, buffer_size)
-            else:
-                mapped.add_edge(free_node, n1, weight=MappedEdge(
-                    t=TensorBufferEdgeType(),
-                    production_rate=1,
-                    consumption_rate=1,
-                    initial_tokens=buffer_size  # Minimum Buffer for now size
-                ))
-
+    #Add edge to remove autoconcurrency
     for n in mapped.nodes:
         mapped.add_edge(n, n, weight=MappedEdge(
             t=RemoveAutoConcurrencyEdgeType(),
@@ -417,6 +427,146 @@ def workload_graph_to_mapped_graph(
 
     return mapped
 
+def add_minimum_buffers(hsdf: DiGraph):
+    NodeType = tuple[MappedNode, int]
+    #Assume Load is done as long as Store is possible
+    load_nodes = list(filter(lambda n: n[0].t.t == 'Load', map(lambda n: cast(NodeType, n), hsdf.nodes)))
+    store_nodes = list(filter(lambda n: n[0].t.t == 'Store', map(lambda n: cast(NodeType, n), hsdf.nodes)))
+    #Prioritize latest instances of a store
+    store_nodes = sorted(store_nodes, key=lambda n: n[1], reverse=True)
+
+    def weight(_1: NodeType, _2: NodeType, d: MappedEdge):
+        return d['weight'].initial_tokens
+
+    for sn in store_nodes:
+        distances = nx.single_source_bellman_ford_path_length(hsdf.reverse(copy=False), sn, weight)
+        for ln in load_nodes:
+            hsdf.add_edge(sn, ln, weight=MappedEdge(
+                t=SchedulingEdgeType(),
+                initial_tokens=1 - distances[ln],
+                production_rate=1,
+                consumption_rate=1,
+            ))
+
+    for n1 in list(map(lambda n: cast(NodeType, n), hsdf.nodes())):
+        #Only the memory of these action must be freed
+        if n1[0].t.t not in ['Computation', 'Transfer', 'Load']:
+                continue
+        children = list(map(lambda d: cast(MappedEdge, d[2]), hsdf.out_edges(data='weight')))
+        if len(children) == 0:
+            continue
+        free_node = (MappedNode(
+            t=MemoryFreeNodeType( n1[0].t.core2 if n1[0].t.t == "Transfer" or n1[0].t.t == "Load" else n1[0].processor, "I" if n1[0].t.t == "Load" else "O"),
+            id=n1[0].id,
+            execution_time=0,
+            processor=None
+        ), n1[1])
+
+        hsdf.add_node(free_node)
+        
+        for n2 in list(map(lambda d: cast(NodeType, d[1]), hsdf.out_edges(n1, data='weight'))):
+            if n2[0].t.t not in ['Computation', 'Transfer', 'Store']:
+                continue
+            if n2[0].t.t == 'Computation':
+                conv1d = cast(Convolution1D, n2[0].t.conv1d)
+                instance = n1[1] % conv1d.kernel_size # Which part of the stride does it occupy?
+                hsdf.add_edge(n2, free_node, weight=MappedEdge(
+                    t=TensorUsedEdgeType(),
+                    initial_tokens=-((conv1d.padding - instance)//conv1d.stride),
+                    production_rate=1,
+                    consumption_rate=1,
+                ))
+            else:
+                # Can free immediatly after transfer
+                hsdf.add_edge(n2, free_node, weight=MappedEdge(
+                    t=TensorUsedEdgeType(),
+                    initial_tokens=0,
+                    production_rate=1,
+                    consumption_rate=1,
+                )) 
+        
+        tokens_in_path = nx.bellman_ford_path_length(hsdf.reverse(copy=False), free_node, n1, weight)
+        hsdf.add_edge(free_node, n1, weight=MappedEdge(
+            t=TensorBufferEdgeType(n1[0].t.output_token_size if n1[0].t.t == 'Load' else n1[0].t.conv1d.output_token_size),
+            initial_tokens=1 - tokens_in_path,
+            production_rate=1,
+            consumption_rate=1,
+        ))
+
+
+
+def optimize(hsdf, optimization_type: OptimizationType) -> (int, np.ndarray):
+    if optimization_type.t == "MinimumMemory":
+        priority = ["throughput", "buffer_size"]
+    elif optimization_type.t == "MinimumLatency":
+        priority = ["buffer_size", "throughput"]
+    else:
+        raise ValueError('Not implemented')
+    
+    from gurobipy import Model, GRB, Var
+    m = Model()
+    processors = set(cast(MappedNode, n).processor for (n, _) in hsdf.nodes)
+    processors.remove(None)
+
+    t = m.addVar(vtype=GRB.CONTINUOUS, lb=0, name="t")
+    if optimization_type.t == "MinimumMemory":
+        m.addConstr(t >= 1e10-4) # No deadlock
+    buffer_size = 0
+    m.setObjectiveN(-t, 1, priority.index("throughput"), name="throughput")
+
+    start_times = { n: m.addVar(vtype=GRB.CONTINUOUS, lb=0) for n in hsdf.nodes }
+    
+
+    for a, b, e in hsdf.edges.data('weight'):
+        a = cast(tuple[MappedNode, int], a)
+        b = cast(tuple[MappedNode, int], b)
+        e = cast(MappedEdge, e)
+
+        if e.t.t == 'TensorBuffer':
+            pass
+            
+            bs = m.addVar(vtype=GRB.INTEGER, lb=0)
+            if b[0].t.t == 'Load':
+                token_size = b[0].t.output_token_size
+            else:
+                token_size = b[0].t.conv1d.output_token_size
+            buffer_size += token_size * bs
+            m.addConstr(start_times[b] >= start_times[a] + t*a[0].execution_time - bs)
+            assert e.initial_tokens > 0
+        elif e.t.t == 'Scheduling':
+            pass
+        else:
+            m.addConstr(start_times[b] >= start_times[a] + t*a[0].execution_time - e.initial_tokens)
+
+    for a in hsdf.nodes:
+        if a[0].processor == None:
+            continue
+        for b in hsdf.nodes:
+            if a > b and a[0].processor == b[0].processor:
+                initial_tokens = m.addVar(vtype=GRB.INTEGER, lb=-float('inf'), ub=float('inf'))
+                m.addConstr(start_times[b] >= start_times[a] + t*a[0].execution_time - initial_tokens)
+                m.addConstr(start_times[a] >= start_times[b] + t*b[0].execution_time - (1 - initial_tokens))
+
+    processors = set(a[0].processor for a in hsdf.nodes)
+
+    for processor in processors:
+        cycle_bound = 0
+        for a in hsdf.nodes:
+            if a[0].processor == processor:
+                cycle_bound += a[0].execution_time
+
+        m.addConstr(cycle_bound*t <= 1)
+    
+    m.setObjectiveN(buffer_size, 0, priority.index("buffer_size"), name="buffer_size")
+    m.write('model.lp')
+    m.setParam(GRB.Param.DualReductions, 0)
+    m.optimize()
+
+    cycle_time = ceil(1/t.X)
+    st = np.array([round(start_times[n].X * cycle_time) for n in hsdf.nodes])
+    return cycle_time, st
+
+       
 
 def mapped_to_hsdf(mapped: DiGraph):
     sdf = Sdf()
@@ -448,36 +598,16 @@ def mapped_to_hsdf(mapped: DiGraph):
             ))
     return result, hsdf.repetitions_vector
 
-def minimum_memory_schedule(hsdf: DiGraph, workload: DiGraph):
+def earliest_first(hsdf: DiGraph, workload: DiGraph):
     processors = set(cast(MappedNode, n).processor for (n, _) in hsdf.nodes)
     processors.remove(None)
-    for n,m,d in hsdf.edges.data('weight'):
-        if cast(MappedEdge, d).t.t == 'TensorBuffer':
-            d.initial_tokens = float('inf')
-    #Avoid infinie throuput by instantiating maximum buffer size
-    for n in filter(hsdf.edges.data('weight')):
-        [buffer] = [d for _,_, d in hsdf.in_edges(n).data() if cast(MappedEdge, d).t.t == 'TensorBuffer']
-        
-        buffer.
-
-
-
-
-
 
     def weight(_1, _2, d):
         return d['weight'].initial_tokens
-    #assert not nx.algorithms.find_negative_cycle(graph, list(graph.nodes)[0], weight)
-    for p in processors:
-        actors = [(n, i) for (n, i) in hsdf.nodes if cast(
-            MappedNode, n).processor == p]
-        
 
     order = [n.id for n in nx.algorithms.topological_sort(workload)]
 
     ordered_nodes = sorted(hsdf.nodes, key=lambda x: (order.index(x[0].id), x[1]))
-
-    cycles = nx.algorithms.find_negative_cycle(hsdf, next(iter(hsdf.nodes)), lambda _1, _2, d: cast(MappedEdge, d['weight']).initial_tokens - 0.0001)
 
     for o in ordered_nodes:
         if o[0].processor == None:
@@ -492,4 +622,27 @@ def minimum_memory_schedule(hsdf: DiGraph, workload: DiGraph):
                     consumption_rate=1,
                 ))
 
+def latest_first(hsdf: DiGraph, workload: DiGraph):
+    processors = set(cast(MappedNode, n).processor for (n, _) in hsdf.nodes)
+    processors.remove(None)
+
+    def weight(_1, _2, d):
+        return d['weight'].initial_tokens
+
+    order = [n.id for n in nx.algorithms.topological_sort(workload)]
+
+    ordered_nodes = sorted(hsdf.nodes, key=lambda x: (order.index(x[0].id), x[1]), reverse=True)
+
+    for o in ordered_nodes:
+        if o[0].processor == None:
+            continue
+        tokens = nx.algorithms.single_source_bellman_ford_path_length(hsdf.reverse(False), o, weight)
+        for target, t in tokens.items():
+            if target[0].processor == o[0].processor:
+                hsdf.add_edge(o, target, weight=MappedEdge(
+                    t=SchedulingEdgeType(),
+                    initial_tokens=1 - t,
+                    production_rate=1,
+                    consumption_rate=1,
+                ))
 
