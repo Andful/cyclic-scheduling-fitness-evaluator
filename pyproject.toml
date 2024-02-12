@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "cyclic_scheduling_dse"
+name = "cyclic_scheduling_fitness_evaluator"
 version = "0.1.0"
 description = ""
 authors = ["Andrea Nardi <buongiorno19972@gmail.com>"]
@@ -8,6 +8,8 @@ license = "MIT"
 [tool.poetry.dependencies]
 python = "^3.10"
 networkx = "^3.2.1"
+sdf-expander = { git = "https://github.com/Andful/sdf-expander.git" }
+gurobipy = "^11.0.0"
 
 [tool.poetry.dev-dependencies]
 

@@ -526,12 +526,12 @@ def optimize(hsdf, optimization_type: OptimizationType) -> (int, np.ndarray):
         if e.t.t == 'TensorBuffer':
             pass
             
-            bs = m.addVar(vtype=GRB.INTEGER, lb=0)
+            bs = m.addVar(vtype=GRB.INTEGER, lb=e.initial_tokens)
             token_size = e.t.buffer_token_size
             buffer_size += token_size * bs
             m.addConstr(start_times[b] >= start_times[a] + t*a[0].execution_time - bs)
             buffers.append((e, bs))
-            assert e.initial_tokens > 0
+            #assert e.initial_tokens > 0
         elif e.t.t == 'Scheduling':
             pass
         else:
@@ -558,7 +558,7 @@ def optimize(hsdf, optimization_type: OptimizationType) -> (int, np.ndarray):
     
     m.setObjectiveN(buffer_size, 0, priority.index("buffer_size"), name="buffer_size")
     m.write('model.lp')
-    #m.setParam(GRB.Param.DualReductions, 0)
+    m.setParam(GRB.Param.OutputFlag, 0)
     m.optimize()
 
     for e, v in buffers:
@@ -566,7 +566,6 @@ def optimize(hsdf, optimization_type: OptimizationType) -> (int, np.ndarray):
 
     cycle_time = ceil(1/t.X)
     st = np.array([round(start_times[n].X * cycle_time) for n in hsdf.nodes])
-    print(f"Cycle time:{cycle_time}")
     return cycle_time, st
 
        

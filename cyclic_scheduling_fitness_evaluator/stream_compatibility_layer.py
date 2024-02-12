@@ -172,8 +172,8 @@ class CyclicFitnessEvaluator(FitnessEvaluator):
 
 
     def __init__(self, workload, original_workload, node_hw_performances, layer_groups_flexible, accelerator, sdf_relation, optimization_type: OptimizationType):
-        self.weights = [-1]
-        self.metrics = ["energy"]
+        self.weights = [-1, -1]
+        self.metrics = ["energy", "latency"]
         self.original_workload = original_workload
         self.workload = workload
         self.layer_groups_flexible = layer_groups_flexible
@@ -266,7 +266,9 @@ class CyclicFitnessEvaluator(FitnessEvaluator):
             finer_trg = self.finer_nodes[node.name]
             production_rate = finer_trg.loop_dim_size[self.sdf_relation]
             assert (finer_trg.operand_tensors['O'].size % production_rate) == 0
-            print(f"HIIII {finer_trg.operand_tensors}")
+            
+            get_size_or_assume_0 = lambda x: x.size if x is not None else 0
+
             cn = WorkloadNode(
                 id=node.name,
                 conv1d=Convolution1D(
@@ -275,7 +277,7 @@ class CyclicFitnessEvaluator(FitnessEvaluator):
                     stride=stride,
                     production_rate=production_rate,
                     output_token_size=finer_trg.operand_tensors['O'].size // production_rate,
-                    input_token_size=finer_trg.operand_tensors['I'].size,
+                    input_token_size=get_size_or_assume_0(finer_trg.operand_tensors.get('I')), # Assume this is not first layer if it has no I
                 ),
                 n_execution=n_execution,
             )
@@ -350,7 +352,6 @@ class CyclicFitnessEvaluator(FitnessEvaluator):
         cycle_time, t = optimize(hsdf, self.optimization_type)
 
         total_buffer_size = sum(e.t.buffer_token_size*e.initial_tokens for e in map(lambda e: cast(MappedEdge, e[2]), hsdf.edges.data('weight')) if e.t.t == 'TensorBuffer')
-        print(f"Total buffer size: {humanbytes(total_buffer_size/8)}")
             
 
         #earliest_first(hsdf, self.mrsdf)
@@ -373,7 +374,7 @@ class CyclicFitnessEvaluator(FitnessEvaluator):
                 sum(get_store_energy(n.id) * n.n_execution for n in self.mrsdf.nodes if self.mrsdf.out_degree(n) == 0) + \
                 sum(get_transfer_energy(n1.id, n2.id) * n1.n_execution for n1, n2 in self.mrsdf.edges if self.get_core(n1.id, layer_core_mapping) != self.get_core(n2.id, layer_core_mapping))
         if not return_scme:
-            return energy,
+            return energy, cycle_time
         else:
 
             def count_repetition(repetition: dict[Hashable, int], a):
