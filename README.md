@@ -1,7 +1,7 @@
 # Cyclic Scheduling of Stream
 
 A custom fitness evaluation for Stream to perform row-wise (or close to row-wise) Layer-Fusion scheduling in Stream.
-This library explots the very symmetric properties of row-wise layer fusion to speeed up analysis time and explore further schedulings.  
+This library exploits the very symmetric properties of row-wise layer fusion to speeed up analysis time and explore further schedulings.  
 The drawback of this techniquer is a small loss at the prologue and the epilogue in terms of latency.
 
 ![scheduling](img.png)
