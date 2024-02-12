@@ -27,8 +27,6 @@ from stream.visualization.memory_usage import humanbytes
 from logging import warning, info
 from .mapping import WorkloadNode, WorkloadEdge, display_workload_graph, workload_graph_to_mapped_graph, display_mapped_graph, mapped_to_hsdf, earliest_first, display_mapped_hsdf, MappedEdge, MappedNode, add_minimum_buffers, Convolution1D, latest_first, OptimizationType, optimize
 
-from cyclic_scheduling import CyclicSchedulingProblem
-
 class IdentifierType(IntEnum):
     LoadInput = 0
     ComputationNode = 1

@@ -1,18 +1,16 @@
-[tool.poetry]
+[project]
 name = "cyclic_scheduling_fitness_evaluator"
 version = "0.1.0"
 description = ""
-authors = ["Andrea Nardi <buongiorno19972@gmail.com>"]
-license = "MIT"
+authors = [{ name="Andrea Nardi", email="buongiorno19972@gmail.com"}]
 
-[tool.poetry.dependencies]
-python = "^3.10"
-networkx = "^3.2.1"
-sdf-expander = { git = "https://github.com/Andful/sdf-expander.git" }
-gurobipy = "^11.0.0"
-
-[tool.poetry.dev-dependencies]
-
-[build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+dependencies = [
+    "networkx >= 3",
+    "sdf-expander@git+https://github.com/Andful/sdf-expander.git",
+    "gurobipy >= 11",
+    "stream-dse@git+https://github.com/Andful/stream-fork.git@draft-custom-fitness-evaluation",
+    "notebook >= 7",
+    "matplotlib == 3.6",
+    "plotly",
+    "pandas",
+]
