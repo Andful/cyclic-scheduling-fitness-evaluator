@@ -23,6 +23,7 @@ from stream.classes.workload.elementwise_node import ElementwiseNode
 from stream.classes.workload.flatten_node import FlattenNode
 from stream.classes.workload.dummy_node import DummyNode
 from stream.classes.hardware.architecture.accelerator import Accelerator
+from stream.visualization.memory_usage import humanbytes
 from logging import warning, info
 from .mapping import WorkloadNode, WorkloadEdge, display_workload_graph, workload_graph_to_mapped_graph, display_mapped_graph, mapped_to_hsdf, earliest_first, display_mapped_hsdf, MappedEdge, MappedNode, add_minimum_buffers, Convolution1D, latest_first, OptimizationType, optimize
 
@@ -265,6 +266,7 @@ class CyclicFitnessEvaluator(FitnessEvaluator):
             finer_trg = self.finer_nodes[node.name]
             production_rate = finer_trg.loop_dim_size[self.sdf_relation]
             assert (finer_trg.operand_tensors['O'].size % production_rate) == 0
+            print(f"HIIII {finer_trg.operand_tensors}")
             cn = WorkloadNode(
                 id=node.name,
                 conv1d=Convolution1D(
@@ -345,7 +347,10 @@ class CyclicFitnessEvaluator(FitnessEvaluator):
 
         #display_mapped_hsdf(hsdf)
         add_minimum_buffers(hsdf)
-        cycle_time, t = optimize(hsdf, self.optimization_type)  
+        cycle_time, t = optimize(hsdf, self.optimization_type)
+
+        total_buffer_size = sum(e.t.buffer_token_size*e.initial_tokens for e in map(lambda e: cast(MappedEdge, e[2]), hsdf.edges.data('weight')) if e.t.t == 'TensorBuffer')
+        print(f"Total buffer size: {humanbytes(total_buffer_size/8)}")
             
 
         #earliest_first(hsdf, self.mrsdf)

@@ -507,10 +507,11 @@ def optimize(hsdf, optimization_type: OptimizationType) -> (int, np.ndarray):
     m = Model()
     processors = set(cast(MappedNode, n).processor for (n, _) in hsdf.nodes)
     processors.remove(None)
+    buffers: list[tuple[MappedEdge, Var]] = []
 
     t = m.addVar(vtype=GRB.CONTINUOUS, lb=0, name="t")
-    if optimization_type.t == "MinimumMemory":
-        m.addConstr(t >= 1e10-4) # No deadlock
+    if optimization_type.t == "MinimumMemory": # TODO: numerically better solution
+        m.addConstr(t*1e+9 >= 1, name='test') # No deadlock
     buffer_size = 0
     m.setObjectiveN(-t, 1, priority.index("throughput"), name="throughput")
 
@@ -526,12 +527,10 @@ def optimize(hsdf, optimization_type: OptimizationType) -> (int, np.ndarray):
             pass
             
             bs = m.addVar(vtype=GRB.INTEGER, lb=0)
-            if b[0].t.t == 'Load':
-                token_size = b[0].t.output_token_size
-            else:
-                token_size = b[0].t.conv1d.output_token_size
+            token_size = e.t.buffer_token_size
             buffer_size += token_size * bs
             m.addConstr(start_times[b] >= start_times[a] + t*a[0].execution_time - bs)
+            buffers.append((e, bs))
             assert e.initial_tokens > 0
         elif e.t.t == 'Scheduling':
             pass
@@ -559,11 +558,15 @@ def optimize(hsdf, optimization_type: OptimizationType) -> (int, np.ndarray):
     
     m.setObjectiveN(buffer_size, 0, priority.index("buffer_size"), name="buffer_size")
     m.write('model.lp')
-    m.setParam(GRB.Param.DualReductions, 0)
+    #m.setParam(GRB.Param.DualReductions, 0)
     m.optimize()
+
+    for e, v in buffers:
+        e.initial_tokens = round(v.X)
 
     cycle_time = ceil(1/t.X)
     st = np.array([round(start_times[n].X * cycle_time) for n in hsdf.nodes])
+    print(f"Cycle time:{cycle_time}")
     return cycle_time, st
 
        
