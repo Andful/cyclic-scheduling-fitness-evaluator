@@ -1,0 +1,12 @@
+Metadata-Version: 2.1
+Name: cyclic_scheduling_fitness_evaluator
+Version: 0.1.0
+Author-email: Andrea Nardi <buongiorno19972@gmail.com>
+Requires-Dist: networkx>=3
+Requires-Dist: sdf-expander@ git+https://github.com/Andful/sdf-expander.git
+Requires-Dist: gurobipy>=11
+Requires-Dist: stream-dse@ git+https://github.com/Andful/stream-fork.git@draft-custom-fitness-evaluation
+Requires-Dist: notebook>=7
+Requires-Dist: matplotlib==3.6
+Requires-Dist: plotly
+Requires-Dist: pandas

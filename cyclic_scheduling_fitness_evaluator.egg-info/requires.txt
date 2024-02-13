@@ -1,0 +1,8 @@
+networkx>=3
+sdf-expander@ git+https://github.com/Andful/sdf-expander.git
+gurobipy>=11
+stream-dse@ git+https://github.com/Andful/stream-fork.git@draft-custom-fitness-evaluation
+notebook>=7
+matplotlib==3.6
+plotly
+pandas

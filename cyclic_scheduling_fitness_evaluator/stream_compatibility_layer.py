@@ -75,10 +75,12 @@ def has_cyclic_dependence(token_graph):
 class AcceleratorVirtualMachine:
     accelerator: Accelerator
     latency: int
+    energy: int
     considered_dimension: str
 
     def __init__(self, accelerator: Accelerator, workload, considered_dimension):
         self.latency = 0
+        self.energy = 0
         from stream.classes.cost_model.scheduler import initialize_offchip_tensors
         self.accelerator = accelerator
         self.workload = workload
@@ -102,15 +104,19 @@ class AcceleratorVirtualMachine:
                     core = self.accelerator.get_core(layer_core_mapping[n.name])
                     [communication_link, *_] = self.accelerator.communication_manager.get_links_for_pair(offchip_core, core)
                     transfer_time = ceil(tensor.size/communication_link.bandwidth)
-                    self.copy_tensor(offchip_core, core, tensor, time_offset, transfer_time, 0) #TODO fix
+                    self.copy_tensor(offchip_core, core, tensor, time_offset, transfer_time)
                     time_offset += transfer_time
         return time_offset
 
 
-    def copy_tensor(self, core1, core2, tensor, start, duration, energy):
+    def copy_tensor(self, core1, core2, tensor, start, duration):
         info(f"Copying {tensor} at {start} from {core1} to {core2}")
-        [communication_link, *_] = self.accelerator.communication_manager.get_links_for_pair(core1, core2)
-        communication_link.transfer(
+        links = self.accelerator.communication_manager.get_links_for_pair(core1, core2)
+        link = max(links, key= lambda link: ceil(tensor.size / link.bandwidth))
+        duration2 = ceil(tensor.size / link.bandwidth)
+        assert duration == duration2
+        energy = link.unit_energy_cost*duration
+        link.transfer(
             CommunicationLinkEvent(
                 "transfer",
                 start=start,
@@ -118,6 +124,11 @@ class AcceleratorVirtualMachine:
                 tensors=[tensor],
                 energy=energy
             )
+        )
+        self.energy += energy
+
+        self.energy += self.accelerator.get_memory_energy_cost_of_transfer(
+            tensor, core1, core2, tensor.memory_operand, tensor.memory_operand
         )
 
         self.accelerator.memory_manager.add_tensor_to_core(
@@ -146,7 +157,7 @@ class AcceleratorVirtualMachine:
             start,
         )
 
-    def compute(self, core, cn, start, duration):
+    def compute(self, core, cn, start, duration, energy):
         info(f"Executing {cn.name} at {start} producing {cn.operand_tensors['O']} in {core}")
         out_tensor = cn.operand_tensors['O']
 
@@ -160,6 +171,10 @@ class AcceleratorVirtualMachine:
         cn.core_allocation = core.id
         cn.start = start
         cn.runtime = duration
+        self.energy += energy
+
+        if cn.onchip_energy is not None:
+            assert cn.onchip_energy == energy
 
 
 class CyclicFitnessEvaluator(FitnessEvaluator):
@@ -171,7 +186,7 @@ class CyclicFitnessEvaluator(FitnessEvaluator):
 
     def __init__(self, workload, original_workload, node_hw_performances, layer_groups_flexible, accelerator, sdf_relation, optimization_type: OptimizationType):
         self.weights = [-1, -1]
-        self.metrics = ["energy", "cycle time"]
+        self.metrics = ["energy estimate", "cycle time"]
         self.original_workload = original_workload
         self.workload = workload
         self.layer_groups_flexible = layer_groups_flexible
@@ -404,8 +419,9 @@ class CyclicFitnessEvaluator(FitnessEvaluator):
                         continue
                     core = self.get_core(actor.id, layer_core_mapping)
                     duration = actor.execution_time
+
                     
-                    vm.compute(core, cn, t, duration)
+                    vm.compute(core, cn, t, duration, self.mappings[actor.id][layer_core_mapping[actor.id]].energy)
                 elif actor.t.t == 'Transfer':
                     (_, (n2, _)) = next(filter(lambda x: x[1][0].t.t == 'Computation', hsdf.out_edges((actor, i))))
                     index = instance*repetition + i
@@ -418,19 +434,19 @@ class CyclicFitnessEvaluator(FitnessEvaluator):
                         continue
                     core1 = self.get_core(cn1.name, layer_core_mapping)
                     core2 = self.get_core(cn2.name, layer_core_mapping)
-                    vm.copy_tensor(core1, core2, cn1.operand_tensors['O'], t, actor.execution_time, 0) # TODO: ifx
+                    vm.copy_tensor(core1, core2, cn1.operand_tensors['O'], t, actor.execution_time)
                 elif actor.t.t == 'Load':
                     cn = computational_nodes.get((actor.id, instance*repetition + i))
                     if cn is None:
                         continue
                     core = self.get_core(cn.name, layer_core_mapping)
-                    vm.copy_tensor(offchip, core, cn.operand_tensors['I'], t, actor.execution_time, 0) # TODO fix
+                    vm.copy_tensor(offchip, core, cn.operand_tensors['I'], t, actor.execution_time)
                 elif actor.t.t == 'Store':
                     cn = computational_nodes.get((actor.id, instance*repetition + i))
                     if cn is None:
                         continue
                     core = self.get_core(cn.name, layer_core_mapping)
-                    vm.copy_tensor(core, offchip, cn.operand_tensors['O'], t, actor.execution_time, 0) # TODO fix
+                    vm.copy_tensor(core, offchip, cn.operand_tensors['O'], t, actor.execution_time)
                 elif actor.t.t == 'MemoryFree':
                     cn = computational_nodes.get((actor.id, instance*repetition + i))
                     if cn is None:
@@ -452,7 +468,7 @@ class CyclicFitnessEvaluator(FitnessEvaluator):
             scme.latency = vm.latency
 
             self.workload
-            scme.energy = energy
+            scme.energy = vm.energy
             return energy, cycle_time, scme
 
     def get_core(self, actor_name: str, layer_core_mapping: Dict[str, int]):
