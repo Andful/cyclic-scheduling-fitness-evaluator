@@ -171,7 +171,7 @@ class CyclicFitnessEvaluator(FitnessEvaluator):
 
     def __init__(self, workload, original_workload, node_hw_performances, layer_groups_flexible, accelerator, sdf_relation, optimization_type: OptimizationType):
         self.weights = [-1, -1]
-        self.metrics = ["energy", "latency"]
+        self.metrics = ["energy", "cycle time"]
         self.original_workload = original_workload
         self.workload = workload
         self.layer_groups_flexible = layer_groups_flexible
