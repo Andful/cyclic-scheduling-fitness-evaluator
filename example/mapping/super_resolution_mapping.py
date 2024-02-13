@@ -9,7 +9,7 @@ mapping = {
             "core_allocation": 1
         },
     "custom_added_Conv3": {
-            "core_allocation": 0
+            "core_allocation": 1
         },
     "custom_added_Conv4": {
             "core_allocation": 1
@@ -21,7 +21,7 @@ mapping = {
             "core_allocation": 1
         },
     "custom_added_Conv7": {
-            "core_allocation": 0
+            "core_allocation": 1
         },
     "custom_added_Conv8": {
             "core_allocation": 1
