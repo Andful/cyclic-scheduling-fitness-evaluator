@@ -7,7 +7,7 @@ The drawback of this technique is a small loss at the prologue and the epilogue 
 ![scheduling](img.png)
 
 ## NOTE
-This library uses a custom version of Stream that allows custom fitness evaluation at [stream-fork](https://github.com/Andful/stream-fork/tree/draft-custom-fitness-evaluation) at commit hash 909dfad
+This library uses a custom version of Stream that allows custom fitness evaluation specified at `pyproject.toml`
 
 ## USAGE
 ```bash
